@@ -22,22 +22,23 @@ class Aggregator:
         while not self._stop_event.is_set():
             try:
                 price = await asyncio.wait_for(self._price_queue.get(), timeout=1.5)
+                if price is None:
+                    continue
                 self._prices[price[0]] = price[1]
+                self._price_queue.task_done()
                 if len(self._prices) >= 1:
                     name, p = min(self._prices.items(), key=lambda x: x[1])
                     logger.info(f"Best price: {name} {p}")
             except TimeoutError:
-                # stop_event часто вешается уже во время wait_for, не в начале run()
                 if self._stop_event.is_set():
                     return
-                # Нет тика >1.5 с — нормально, не ERROR
                 logger.debug("Aggregator: no quote within timeout, waiting…")
             except asyncio.CancelledError:
                 logger.info("Aggregator task cancelled (shutdown)")
                 raise
             except Exception as e:
                 logger.error(f"Aggregator error: {e}")
-                return
+                continue
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +77,6 @@ class BybitExchange(Exchange):
         stop_event: asyncio.Event,
         price_queue: asyncio.Queue,
     ) -> int | float | None:
-        max_tries = 3
         async with session.ws_connect(self._config.url) as ws:
             logger.info("Trading bybit websocket")
             sub = self._config.params
@@ -100,16 +100,9 @@ class BybitExchange(Exchange):
                         await asyncio.wait_for(
                             price_queue.put((self.name, price)), timeout=1
                         )
-                        max_tries = 3
                 except TimeoutError:
                     logger.error("Bybit websocket queue is full")
-                    await asyncio.sleep(1)
-                    if max_tries > 0:
-                        max_tries -= 1
-                        continue
-                    else:
-                        logger.error("Bybit websocket queue is full")
-                        return None
+                    return None
                 if message.type == aiohttp.WSMsgType.CLOSED:
                     logger.warning("Bybit websocket closed")
                     return None
@@ -126,7 +119,6 @@ class OkxExchange(Exchange):
         price_queue: asyncio.Queue,
     ) -> int | float | None:
         async with session.ws_connect(self._config.url) as ws:
-            max_tries = 3
             logger.info("Trading okx websocket")
             sub = self._config.params
             await ws.send_json(sub)
@@ -149,16 +141,9 @@ class OkxExchange(Exchange):
                         await asyncio.wait_for(
                             price_queue.put((self.name, price)), timeout=1
                         )
-                        max_tries = 3
                 except TimeoutError:
                     logger.error("Okx websocket queue is full")
-                    await asyncio.sleep(1)
-                    if max_tries > 0:
-                        max_tries -= 1
-                        continue
-                    else:
-                        logger.error("Okx websocket queue is full")
-                        return None
+                    return None
                 if message.type == aiohttp.WSMsgType.CLOSED:
                     logger.warning("Okx websocket closed")
                     return None
@@ -255,12 +240,13 @@ async def main() -> None:
     stop_event = asyncio.Event()
     price_queue = asyncio.Queue(maxsize=100)
 
-    def signal_handler(signum, frame):
+    def signal_handler():
         logger.info("Signal received, stopping...")
         stop_event.set()
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, signal_handler)
+    loop.add_signal_handler(signal.SIGTERM, signal_handler)
 
     async with aiohttp.ClientSession() as session:
         exchanges = build_exchanges_websocket()
@@ -271,7 +257,6 @@ async def main() -> None:
                 for exchange in exchanges
             ]
         )
-        # Воркеры бирж закончили — просим агрегатор выйти; иначе он висит в get()
         stop_event.set()
         agg_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
